@@ -19,7 +19,7 @@ from omnisafe.typing import AdvatageEstimator, OmnisafeSpace
 from omnisafe.common.buffer.onpolicy_buffer import OnPolicyBuffer
 from omnisafe.utils.math import discount_cumsum
 from omnisafe.models.critic.critic_builder import CriticBuilder
-from buffer import (
+from memory import (
     LFFVectorOnPolicyBuffer,
 )
 import os
@@ -34,9 +34,10 @@ class MICEAdapter(OnPolicyAdapter):
         steps_per_epoch: int,
         agent: ConstraintActorCritic,
         buffer: LFFVectorOnPolicyBuffer,  
-        failure_buffer,
+        flashbulb_memory,
         logger: Logger,
         rpnet,
+        intrinsicG,
         epoch,
     ) -> None:
         self._reset_log()
@@ -65,14 +66,13 @@ class MICEAdapter(OnPolicyAdapter):
             roll_state = torch.cat((roll_state, obs), dim=1)
             roll_cost = torch.cat((roll_cost, info.get('original_cost', cost).unsqueeze(1)), dim=1)
 
-            
-            risk_metrics = torch.zeros_like(cost)
-            if len(failure_buffer.ep_state) > 0:
+            intrinsic_costs = torch.zeros_like(cost)
+            if len(flashbulb_memory.ep_state) > 0:
                 for idx, roll_s in enumerate(roll_state):  
-                    for (fail_t, fail_c) in zip(failure_buffer.ep_state, failure_buffer.ep_cost):
+                    for (fail_t, fail_c) in zip(flashbulb_memory.ep_state, flashbulb_memory.ep_cost):
                         
                         if ep_cost[idx] < 1:
-                            risk_metrics[idx] = torch.tensor(0.0, device=obs.device)
+                            intrinsic_costs[idx] = torch.tensor(0.0, device=obs.device)
                             break
                         else:
                             t_cost_weight = roll_cost[idx].repeat_interleave(obs.shape[1])
@@ -80,21 +80,28 @@ class MICEAdapter(OnPolicyAdapter):
                             mask_len = min(roll_s.shape[0], fail_t.shape[0])
                             similarity = (
                                 torch.dist(
-                                    fail_t[: mask_len] * t_cost_weight[: mask_len],
-                                    roll_s[: mask_len] * t_cost_weight[: mask_len],
+                                    rpnet(fail_t[: mask_len] * t_cost_weight[: mask_len]),
+                                    rpnet(roll_s[: mask_len] * t_cost_weight[: mask_len]),
                                 )
                                 / ep_cost[idx]
                             )
-                            risk_metrics[idx] += self._cfgs.algo_cfgs.risk_factor / (1 + torch.exp(similarity))
+                            intrinsic_costs[idx] += self._cfgs.algo_cfgs.risk_factor / (1 + torch.exp(similarity))
                         
-
-                    risk_metrics[idx] = (self._cfgs.algo_cfgs.risk_gamma**epoch) *  risk_metrics[idx] / len(failure_buffer.ep_state)
+                    intrinsic_costs[idx] = (self._cfgs.algo_cfgs.risk_gamma**epoch) *  intrinsic_costs[idx] / len(flashbulb_memory.ep_state)
                    
+                    for _ in range(self._cfgs.algo_cfgs.num_epochs):
+                        self._cfgs.algo_cfgs.optimizer.zero_grad()
+                        rp_traj = rpnet(roll_s)
+                        ci_pre = intrinsicG(rp_traj)
+                        loss = self._cfgs.algo_cfgs.criterion(ci_pre, intrinsic_costs[idx])
+                        loss.backward()
+                        self._cfgs.algo_cfgs.optimizer.step()
+                    intrinsic_costs[idx] = intrinsicG(rpnet(roll_s))
                     if epoch % 10 == 0 and idx == 6 and ep_cost[idx] > 0:
                         with open(os.path.join(logger._log_dir, 'risk_cost.txt'), 'a') as file:
-                            file.write(f'risk_metric: {risk_metrics[idx].item()}\n')
+                            file.write(f'intrinsic_cost: {intrinsic_costs[idx].item()}\n')
                             file.write(f'ep_cost: {ep_cost[idx].item()}\n\n')
-
+                    
             buffer.store(
                 obs=obs,
                 act=act,
@@ -104,7 +111,7 @@ class MICEAdapter(OnPolicyAdapter):
                 value_c=value_c,
                 logp=logp,
                 discount_cost=self._discount_cost,
-                risk_metrics=risk_metrics, 
+                intrinsic_costs=intrinsic_costs, 
                 time_step=self._ep_len - 1,
             )  
             obs = next_obs
@@ -136,15 +143,15 @@ class MICEAdapter(OnPolicyAdapter):
                             logger, idx
                         )  
                         if self._ep_cost[idx] > self._cfgs.algo_cfgs.cost_limit + 15:
-                            failure_buffer.ep_state.append(roll_state[idx])  
-                            failure_buffer.ep_cost.append(roll_cost[idx])
+                            flashbulb_memory.ep_state.append(roll_state[idx])  
+                            flashbulb_memory.ep_cost.append(roll_cost[idx])
                         self._reset_log(idx)
 
                         self._ep_ret[idx] = 0.0
                         self._ep_cost[idx] = 0.0
                         self._ep_len[idx] = 0.0
                     buffer.finish_path(last_value_r, last_value_c, idx) 
-        return failure_buffer
+        return flashbulb_memory
 
 
     def _log_value(
