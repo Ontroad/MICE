@@ -51,7 +51,7 @@ class LFFOnPolicyBuffer(OnPolicyBuffer):
             standardized_adv_c,
             device,
         )
-        self.data['risk_metrics'] = torch.zeros((size,), dtype=torch.float32, device=device)
+        self.data['intrinsic_costs'] = torch.zeros((size,), dtype=torch.float32, device=device)
         self.data['discount_cost'] = torch.zeros((size,), dtype=torch.float32, device=device)
         self.data['time_step'] = torch.zeros((size,), dtype=torch.float32, device=device)
 
@@ -71,7 +71,7 @@ class LFFOnPolicyBuffer(OnPolicyBuffer):
             'cost': self.data['cost'],  
             'discount_cost': self.data['discount_cost'],  
             'value_c': self.data['value_c'],  
-            'risk_metrics': self.data['risk_metrics'],  
+            'intrinsic_costs': self.data['intrinsic_costs'],  
             'time_step': self.data['time_step'],
         }
 
@@ -88,12 +88,12 @@ class LFFOnPolicyBuffer(OnPolicyBuffer):
         self,
         last_value_r: torch.Tensor = torch.zeros(1),
         last_value_c: torch.Tensor = torch.zeros(1),
-        risk_metric: torch.Tensor = torch.zeros(1),
+        intrinsic_cost: torch.Tensor = torch.zeros(1),
     ) -> None:
         path_slice = slice(self.path_start_idx, self.ptr)  
         last_value_r = last_value_r.to(self._device)  
         last_value_c = last_value_c.to(self._device)
-        risk_metric = risk_metric.to(self._device)
+        intrinsic_cost = intrinsic_cost.to(self._device)
 
         rewards = torch.cat(
             [self.data['reward'][path_slice], last_value_r]
@@ -111,7 +111,7 @@ class LFFOnPolicyBuffer(OnPolicyBuffer):
         self.data['discount_cost'][path_slice] = discounted_cost
 
         
-        self.data['risk_metrics'][path_slice] = risk_metric
+        self.data['intrinsic_costs'][path_slice] = intrinsic_cost
 
         adv_r, target_value_r = self._calculate_adv_and_value_targets(
             values_r, rewards, lam=self._lam
@@ -168,11 +168,11 @@ class LFFVectorOnPolicyBuffer(VectorOnPolicyBuffer):
         self,
         last_value_r: torch.Tensor = torch.zeros(1),
         last_value_c: torch.Tensor = torch.zeros(1),
-        risk_metric: torch.Tensor = torch.zeros(1),
+        intrinsic_cost: torch.Tensor = torch.zeros(1),
         idx: int = 0,
     ) -> None:
         """Finish the path."""
-        self.buffers[idx].finish_path(last_value_r, last_value_c, risk_metric)
+        self.buffers[idx].finish_path(last_value_r, last_value_c, intrinsic_cost)
 
 
 
@@ -439,9 +439,9 @@ class LFFM2Buffer(LFFOnPolicyBuffer):
         adv_r, target_value_r = self._calculate_adv_and_value_targets(
             values_r, rewards, lam=self._lam
         )
-        risk_metrics = self.data['risk_metrics'][path_slice] 
-        adv_c, target_value_c = self._calculate_adv_and_value_risk_targets(
-            values_c, costs, lam=self._lam_c, risk_metrics=risk_metrics
+        intrinsic_costs = self.data['intrinsic_costs'][path_slice] 
+        adv_c, target_value_c = self._calculate_adv_and_value_intrinsic_targets(
+            values_c, costs, lam=self._lam_c, intrinsic_costs=intrinsic_costs
         )
 
         self.data['adv_r'][path_slice] = adv_r
@@ -451,18 +451,18 @@ class LFFM2Buffer(LFFOnPolicyBuffer):
 
         self.path_start_idx = self.ptr  
 
-    def _calculate_adv_and_value_risk_targets(
+    def _calculate_adv_and_value_intrinsic_targets(
         self,
         values: torch.Tensor,
         rewards: torch.Tensor,
         lam: float,
-        risk_metrics: torch.Tensor,
+        intrinsic_costs: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
         if self._advantage_estimator == 'gae':
             
             deltas = rewards[:-1] + self._gamma * values[1:] - values[:-1]  
-            adv = discount_cumsum(deltas, self._gamma * lam) + risk_metrics 
+            adv = discount_cumsum(deltas, self._gamma * lam) + intrinsic_costs 
             target_value = adv + values[:-1]
 
         else:
