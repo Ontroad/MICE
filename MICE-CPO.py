@@ -30,7 +30,7 @@ from omnisafe.utils.tools import (
     set_param_values_to_model,
 )
 from rollout import MICEAdapter
-from buffer import LFFMVectorBuffer, LFFM2VectorBuffer, FailBuffer
+from memory import LFFMVectorBuffer, LFFM2VectorBuffer, FailBuffer
 import utils as utl
 import os
 
@@ -52,8 +52,8 @@ class MICECPO(CPO):
         )
 
     def _init(self) -> None:
-        self._risk_penalty_type = self._cfgs.algo_cfgs.risk_penalty_type 
-        if self._risk_penalty_type == 0:
+        self._optimization_type = self._cfgs.algo_cfgs.risk_penalty_type 
+        if self._optimization_type == 0:
             self._buf = LFFM2VectorBuffer(
                 obs_space=self._env.observation_space,
                 act_space=self._env.action_space,
@@ -68,7 +68,7 @@ class MICECPO(CPO):
                 num_envs=self._cfgs.train_cfgs.vector_env_nums,
                 device=self._device,
             )
-        elif self._risk_penalty_type in [1, 2]:
+        elif self._optimization_type in [1, 2]:
             self._buf = LFFMVectorBuffer(
             obs_space=self._env.observation_space,
             act_space=self._env.action_space,
@@ -85,13 +85,14 @@ class MICECPO(CPO):
         )
             
         self.RPNet = utl.RandomProjection(self._cfgs.algo_cfgs.input_dim, self._cfgs.algo_cfgs.output_dim).to(self._device)
+        self._IntrinsicG = utl.IntrinsicGenerator(self._cfgs.algo_cfgs.output_dim, self._cfgs.algo_cfgs.hidden_dim, self._cfgs.algo_cfgs.cost_dim).to(self._device)
         self._maxlen_fail = self._cfgs.algo_cfgs.fail_buf_size 
-        self._failure_buf = FailBuffer(size=self._maxlen_fail)
+        self._flashbulb_memory = FailBuffer(size=self._maxlen_fail)
 
 
     def _init_log(self) -> None:
         super()._init_log()
-        self._logger.register_key('Train/risk_metrics')
+        self._logger.register_key('Train/intrinsic_costs')
         self._logger.register_key('Value/Adv_c')
         self._logger.register_key('Eval/true_value_c')
         self._logger.register_key('Eval/estimate_value_c')
@@ -104,13 +105,14 @@ class MICECPO(CPO):
             epoch_time = time.time()
 
             roll_out_time = time.time()
-            self._failure_buf = self._env.roll_out( 
+            self._flashbulb_memory = self._env.roll_out( 
                 steps_per_epoch=self._steps_per_epoch,
                 agent=self._actor_critic,
                 buffer=self._buf,
-                failure_buffer=self._failure_buf,  
+                flashbulb_memory=self._flashbulb_memory,  
                 logger=self._logger,
                 rpnet=self.RPNet, 
+                intrinsicG=self._IntrinsicG,
                 epoch=epoch,
             )
             self._logger.store(**{'Train/Epoch': epoch})
@@ -176,7 +178,7 @@ class MICECPO(CPO):
             target_value_c,
             adv_r,
             adv_c,
-            risk_metrics,
+            intrinsic_costs,
         ) = (
             data['obs'],
             data['act'],
@@ -185,9 +187,9 @@ class MICECPO(CPO):
             data['target_value_c'],
             data['adv_r'],
             data['adv_c'],
-            data['risk_metrics'],  
+            data['intrinsic_costs'],  
         )
-        self._update_actor(obs, act, logp, adv_r, adv_c, risk_metrics)
+        self._update_actor(obs, act, logp, adv_r, adv_c, intrinsic_costs)
 
         dataloader = DataLoader(
             dataset=TensorDataset(obs, act, logp, target_value_r, target_value_c, adv_r, adv_c),
@@ -225,7 +227,7 @@ class MICECPO(CPO):
         logp: torch.Tensor,
         adv_r: torch.Tensor,
         adv_c: torch.Tensor,
-        risk_metrics: torch.Tensor,
+        intrinsic_costs: torch.Tensor,
     ) -> None:
         self._fvp_obs = obs[:: self._cfgs.algo_cfgs.fvp_sample_freq]
         theta_old = get_flat_params_from(self._actor_critic.actor)  
@@ -247,7 +249,7 @@ class MICECPO(CPO):
         alpha = torch.sqrt(2 * self._cfgs.algo_cfgs.target_kl / (xHx + 1e-8)) 
 
         self._actor_critic.zero_grad()
-        loss_cost, ratio = self._loss_pi_cost(obs, act, logp, adv_c, risk_metrics)  
+        loss_cost, ratio = self._loss_pi_cost(obs, act, logp, adv_c, intrinsic_costs)  
         loss_cost_before = distributed.dist_avg(loss_cost).item()
 
         loss_cost.backward()
@@ -258,11 +260,11 @@ class MICECPO(CPO):
         )  
 
         ep_costs = self._logger.get_stats('Metrics/EpCost')[0] - self._cfgs.algo_cfgs.cost_limit
-        if self._risk_penalty_type == 1:
+        if self._optimization_type == 1:
             ep_costs = (
                 self._logger.get_stats('Metrics/EpCost')[0]
                 - self._cfgs.algo_cfgs.cost_limit
-                + (ratio * risk_metrics).mean()
+                + (ratio * intrinsic_costs).mean()
             ) 
 
         p = conjugate_gradients(self._fvp, b_grad, self._cfgs.algo_cfgs.cg_iters)  # H^-1*b
@@ -347,7 +349,7 @@ class MICECPO(CPO):
             logp=logp,
             adv_r=adv_r,
             adv_c=adv_c,
-            risk_metrics=risk_metrics,
+            intrinsic_costs=intrinsic_costs,
             loss_reward_before=loss_reward_before,
             loss_cost_before=loss_cost_before,
             total_steps=20,
@@ -360,7 +362,7 @@ class MICECPO(CPO):
 
         with torch.no_grad():
             loss_reward, info = self._loss_pi(obs, act, logp, adv_r)
-            loss_cost, _ = self._loss_pi_cost(obs, act, logp, adv_c, risk_metrics)
+            loss_cost, _ = self._loss_pi_cost(obs, act, logp, adv_c, intrinsic_costs)
             loss = loss_reward + loss_cost
 
         self._logger.store(
@@ -369,7 +371,7 @@ class MICECPO(CPO):
                 'Train/Entropy': info['entropy'],
                 'Train/PolicyRatio': info['ratio'],
                 'Train/PolicyStd': info['std'],
-                'Train/risk_metrics': risk_metrics.mean().item(),
+                'Train/intrinsic_costs': intrinsic_costs.mean().item(),
                 'Misc/AcceptanceStep': accept_step,
                 'Misc/Alpha': alpha.item(),
                 'Misc/FinalStepNorm': step_direction.norm().mean().item(),
@@ -398,7 +400,7 @@ class MICECPO(CPO):
         logp: torch.Tensor,
         adv_r: torch.Tensor,
         adv_c: torch.Tensor,
-        risk_metrics: torch.Tensor,
+        intrinsic_costs: torch.Tensor,
         loss_reward_before: float,
         loss_cost_before: float,
         total_steps: int = 15,
@@ -427,7 +429,7 @@ class MICECPO(CPO):
                     continue
                 
                 loss_cost, _ = self._loss_pi_cost(
-                    obs=obs, act=act, logp=logp, adv_c=adv_c, risk_metrics=risk_metrics
+                    obs=obs, act=act, logp=logp, adv_c=adv_c, intrinsic_costs=intrinsic_costs
                 )  
                 
                 q_dist = self._actor_critic.actor(obs)  
@@ -485,14 +487,14 @@ class MICECPO(CPO):
         act: torch.Tensor,
         logp: torch.Tensor,
         adv_c: torch.Tensor,
-        risk_metrics: torch.Tensor,
+        intrinsic_costs: torch.Tensor,
     ) -> torch.Tensor:
         self._actor_critic.actor(obs)
         logp_ = self._actor_critic.actor.log_prob(act)
         ratio = torch.exp(logp_ - logp)
         cost_loss = (ratio * adv_c).mean() 
-        if self._risk_penalty_type == 2:  
-            risk_metric = (ratio * risk_metrics).mean()  
-            cost_loss += risk_metric
+        if self._optimization_type == 2:  
+            intrinsic_cost = (ratio * intrinsic_costs).mean()  
+            cost_loss += intrinsic_cost
         return cost_loss, ratio
 
