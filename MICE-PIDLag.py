@@ -8,7 +8,7 @@ from omnisafe.common.pid_lagrange import PIDLagrangian
 from omnisafe.common.lagrange import Lagrange
 from omnisafe.utils import distributed
 from rollout import MICEAdapter
-from omnisafe.algorithms.on_policy.learn_failure.buffer import LFFMVectorBuffer, LFFM2VectorBuffer, FailBuffer
+from memory import LFFMVectorBuffer, LFFM2VectorBuffer, FailBuffer
 import os
 import time
 from typing import Dict, Tuple, Optional, Union
@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 
 @registry.register
-class LFFM_PIDLag(PPO):
+class MICE_PIDLag(PPO):
 
     def _init_env(self) -> None:
         self._env = MICEAdapter(
@@ -34,9 +34,9 @@ class LFFM_PIDLag(PPO):
         )
 
     def _init(self) -> None:
-        self._risk_penalty_type = self._cfgs.algo_cfgs.risk_penalty_type 
+        self._optimization_type = self._cfgs.algo_cfgs.risk_penalty_type 
 
-        if self._risk_penalty_type == 0:
+        if self._optimization_type == 0:
             self._buf = LFFM2VectorBuffer(
                 obs_space=self._env.observation_space,
                 act_space=self._env.action_space,
@@ -51,7 +51,7 @@ class LFFM_PIDLag(PPO):
                 num_envs=self._cfgs.train_cfgs.vector_env_nums,
                 device=self._device,
             )
-        elif self._risk_penalty_type in [1, 2]:
+        elif self._optimization_type in [1, 2]:
             self._buf = LFFMVectorBuffer(
             obs_space=self._env.observation_space,
             act_space=self._env.action_space,
@@ -67,14 +67,15 @@ class LFFM_PIDLag(PPO):
             device=self._device,
         )
         self.RPNet = utl.RandomProjection(self._cfgs.algo_cfgs.input_dim, self._cfgs.algo_cfgs.output_dim).to(self._device)
+        self._IntrinsicG = utl.IntrinsicGenerator(self._cfgs.algo_cfgs.output_dim, self._cfgs.algo_cfgs.hidden_dim, self._cfgs.algo_cfgs.cost_dim).to(self._device)
         self._maxlen_fail = self._cfgs.algo_cfgs.fail_buf_size 
-        self._failure_buf = FailBuffer(size=self._maxlen_fail)
+        self._flashbulb_memory = FailBuffer(size=self._maxlen_fail)
          
         self._pidlag = PIDLagrangian(**self._cfgs.pidlag_cfgs)
 
     def _init_log(self) -> None:
         super()._init_log()
-        self._logger.register_key('Train/risk_metrics')
+        self._logger.register_key('Train/intrinsic_costs')
         self._logger.register_key('Value/Adv_c')
         self._logger.register_key('Eval/true_value_c')
         self._logger.register_key('Eval/estimate_value_c')
@@ -88,13 +89,14 @@ class LFFM_PIDLag(PPO):
             epoch_time = time.time()
 
             roll_out_time = time.time()
-            self._failure_buf = self._env.roll_out( 
+            self._flashbulb_memory = self._env.roll_out( 
                 steps_per_epoch=self._steps_per_epoch,
                 agent=self._actor_critic,
                 buffer=self._buf,
-                failure_buffer=self._failure_buf,  
+                flashbulb_memory=self._flashbulb_memory,  
                 logger=self._logger,
-                rpnet=self.RPNet,  
+                rpnet=self.RPNet,
+                intrinsicG=self._IntrinsicG,  
                 epoch=epoch,
             )
             self._logger.store(**{'Train/Epoch': epoch})
@@ -155,7 +157,7 @@ class LFFM_PIDLag(PPO):
 
     def _update(self) -> None:
         data = self._buf.get() 
-        obs, act, logp, target_value_r, target_value_c, adv_r, adv_c, risk_metrics = (
+        obs, act, logp, target_value_r, target_value_c, adv_r, adv_c, intrinsic_costs = (
             data['obs'],
             data['act'],
             data['logp'],
@@ -163,12 +165,12 @@ class LFFM_PIDLag(PPO):
             data['target_value_c'], 
             data['adv_r'],
             data['adv_c'],
-            data['risk_metrics'],   
+            data['intrinsic_costs'],   
         )
 
         Jc = self._logger.get_stats('Metrics/EpCost')[0]  
-        if self._risk_penalty_type == 1:
-            Jc -= risk_metrics.mean()
+        if self._optimization_type == 1:
+            Jc -= intrinsic_costs.mean()
 
         self._pidlag.pid_update(Jc)  
 
@@ -216,7 +218,7 @@ class LFFM_PIDLag(PPO):
                 'Value/Adv': adv_r.mean().item(),
                 'Value/Adv_c': adv_c.mean().item(),
                 'Train/KL': kl,
-                'Train/risk_metrics': risk_metrics.mean().item(),
+                'Train/intrinsic_costs': intrinsic_costs.mean().item(),
             }
         )
 
