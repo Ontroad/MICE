@@ -50,11 +50,54 @@ def estimate_true_value(
         torch.stack(estimate_cvalues)
     )
 
-
-class RandomProjection(torch.nn.Module):
+    
+class RandomProjection:
     def __init__(self, input_dim, output_dim):
-        super(RandomProjection, self).__init__()
-        self.linear_projection = torch.nn.Linear(input_dim, output_dim)
+        """
+        Args:
+            input_dim (int): The dimension of the input features.
+            output_dim (int): The dimension of the output features (projected space).
+        """
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.projection_matrix = self._generate_projection_matrix()
+
+    def _generate_projection_matrix(self):
+        """
+        Generates a random Gaussian projection matrix.
+        """
+        return torch.randn(self.output_dim, self.input_dim) / torch.sqrt(torch.tensor(self.output_dim, dtype=torch.float32))
+
+    def project(self, trajectory):
+        """
+        Projects the input trajectory to the lower-dimensional space using the random projection matrix.
+
+        Args:
+            trajectory (torch.Tensor): The input trajectory data of shape (n_samples, input_dim).
+
+        Returns:
+            torch.Tensor: The projected trajectory of shape (n_samples, output_dim).
+        """
+        return torch.matmul(trajectory, self.projection_matrix.T)
+
+    
+class IntrinsicGenerator(torch.nn.Module):
+    def __init__(self, input_dim, hidden_dims, output_dim, activation=torch.nn.ReLU):
+    
+        super(IntrinsicGenerator, self).__init__()
+        self.layers = torch.nn.ModuleList()
+        self.activation = activation
+
+        prev_dim = input_dim
+        for hidden_dim in hidden_dims:
+            self.layers.append(torch.nn.Linear(prev_dim, hidden_dim))
+            prev_dim = hidden_dim
+        
+        self.layers.append(torch.nn.Linear(prev_dim, output_dim))
 
     def forward(self, x):
-        return self.linear_projection(x)
+        
+        for layer in self.layers[:-1]:
+            x = self.activation()(layer(x))
+        x = self.layers[-1](x)
+        return x
