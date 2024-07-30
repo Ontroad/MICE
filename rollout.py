@@ -3,6 +3,7 @@ from typing import Dict, Tuple, Optional, Union
 import torch
 import numpy as np
 import torch.nn.functional as F
+import heapq
 
 from omnisafe.algorithms import registry
 from omnisafe.algorithms.on_policy.base.ppo import PPO
@@ -142,7 +143,13 @@ class MICEAdapter(OnPolicyAdapter):
                         self._log_metrics(
                             logger, idx
                         )  
-                        if self._ep_cost[idx] > self._cfgs.algo_cfgs.cost_limit + 15:
+                        if self._ep_cost[idx] > self._cfgs.algo_cfgs.cost_limit:
+                            if len(flashbulb_memory.ep_state) == self._cfgs.algo_cfgs.fail_buf_size:
+                                if len(flashbulb_memory.ep_cost) >= self._cfgs.algo_cfgs.len_sort:
+                                    smallest_costs = heapq.nsmallest(1, flashbulb_memory.ep_cost[:self._cfgs.algo_cfgs.len_sort])
+                                    smallest_cost = smallest_costs[0]
+                                    flashbulb_memory.ep_cost.remove(smallest_cost)
+                                    flashbulb_memory.ep_state.remove(flashbulb_memory.ep_state[flashbulb_memory.ep_cost.index(smallest_cost)])
                             flashbulb_memory.ep_state.append(roll_state[idx])  
                             flashbulb_memory.ep_cost.append(roll_cost[idx])
                         self._reset_log(idx)
